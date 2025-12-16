@@ -136,10 +136,26 @@ class GitOperations:
         return normalized_remote in project_urls
 
     def _normalize_url(self, url: str) -> str:
-        """Normalise une URL Git pour la comparaison."""
-        normalized = url.rstrip("/")
+        """Normalise une URL Git pour la comparaison.
+        
+        Supprime les credentials (user:pass@) et normalise l'URL pour permettre
+        la comparaison entre URLs avec/sans token.
+        
+        Exemples:
+        - https://oauth2:TOKEN@gitlab.com/groupe/projet.git -> https://gitlab.com/groupe/projet
+        - git@gitlab.com:groupe/projet.git -> git@gitlab.com:groupe/projet
+        """
+        import re
+        
+        # Supprimer les credentials des URLs HTTP/HTTPS (format: user:pass@)
+        # Ex: https://oauth2:TOKEN@gitlab.com/... -> https://gitlab.com/...
+        normalized = re.sub(r"://[^@]+@", "://", url)
+        
+        # Normaliser la fin de l'URL
+        normalized = normalized.rstrip("/")
         if normalized.endswith(".git"):
             normalized = normalized[:-4]
+        
         return normalized.lower()
 
     def get_last_fetch_time(self, path: Path) -> Optional[float]:
