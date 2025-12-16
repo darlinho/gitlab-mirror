@@ -1,6 +1,9 @@
 """Opérations Git pour le clonage et la mise à jour des dépôts."""
 
+import os
+import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from functools import wraps
@@ -86,19 +89,16 @@ class GitOperations:
 
     def get_clone_url(self, project: GitLabProject) -> str:
         """Retourne l'URL de clonage selon la méthode configurée.
-
-        Pour HTTP, inclut le token dans l'URL pour éviter les prompts de credentials.
-        Format: https://oauth2:TOKEN@gitlab.com/groupe/projet.git
+        
+        Pour HTTP, retourne l'URL SANS token pour des raisons de sécurité.
+        Le token sera fourni via GIT_ASKPASS ou credential helper.
         """
         if self.config.clone_method == "ssh":
             return project.ssh_url_to_repo
 
-        # Pour HTTP, inclure le token dans l'URL pour éviter les demandes de credentials
-        http_url = project.http_url_to_repo
-        if self.config.token and http_url.startswith("https://"):
-            # Insérer oauth2:token@ après https://
-            return http_url.replace("https://", f"https://oauth2:{self.config.token}@")
-        return http_url
+        # Pour HTTP, retourner l'URL sans token (plus sécuritaire)
+        # Le token sera fourni via GIT_ASKPASS ou credential helper
+        return project.http_url_to_repo
 
     def is_git_repository(self, path: Path) -> bool:
         """Vérifie si un chemin est un dépôt Git valide."""
@@ -328,55 +328,181 @@ class GitOperations:
             error_msg = f"Erreur inattendue lors du clonage: {e}"
             return False, error_msg
 
+    def _create_askpass_script(self) -> Optional[Path]:
+        """Crée un script GIT_ASKPASS temporaire pour fournir le token de manière sécurisée.
+        
+        Returns:
+            Chemin du script temporaire ou None si pas de token
+        """
+        if not self.config.token or self.config.clone_method == "ssh":
+            return None
+        
+        # Créer un script temporaire qui retourne le token
+        fd, script_path = tempfile.mkstemp(prefix="lgm_askpass_", suffix=".sh", text=True)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("#!/bin/sh\n")
+                f.write(f'echo "{self.config.token}"\n')
+            
+            # Rendre le script exécutable
+            os.chmod(script_path, stat.S_IRUSR | stat.S_IXUSR)
+            return Path(script_path)
+        except Exception as e:
+            logger.debug(f"Erreur lors de la création du script askpass: {e}")
+            try:
+                os.unlink(script_path)
+            except Exception:
+                pass
+            return None
+
+    def _setup_credential_helper(self, repo_path: Path) -> None:
+        """Configure le credential helper pour un dépôt après clonage.
+        
+        Nettoie aussi le remote pour enlever le token s'il y en a un.
+        
+        Args:
+            repo_path: Chemin du dépôt cloné
+        """
+        try:
+            repo = git.Repo(repo_path)
+            
+            # Nettoyer le remote pour enlever le token s'il y en a un
+            if "origin" in repo.remotes:
+                remote = repo.remotes.origin
+                remote_url = remote.url
+                
+                # Si l'URL contient des credentials, les enlever
+                import re
+                clean_url = re.sub(r"://[^@]+@", "://", remote_url)
+                
+                if clean_url != remote_url:
+                    logger.debug(f"Nettoyage du remote pour {repo_path}")
+                    remote.set_url(clean_url)
+                    
+                    # Configurer le credential helper pour ce dépôt
+                    # Utiliser credential.helper store pour ce repo spécifique
+                    repo.git.config("credential.helper", "store", local=True)
+                    
+                    # Stocker le credential de manière sécurisée
+                    self._store_credential(repo_path, clean_url)
+        except Exception as e:
+            logger.debug(f"Erreur lors de la configuration du credential helper: {e}")
+
+    def _store_credential(self, repo_path: Path, url: str) -> None:
+        """Stocke les credentials dans le credential store de Git.
+        
+        Args:
+            repo_path: Chemin du dépôt
+            url: URL du remote (sans credentials)
+        """
+        try:
+            # Extraire l'host de l'URL
+            import re
+            match = re.search(r"://([^/]+)", url)
+            if not match:
+                return
+            
+            host = match.group(1)
+            credential_line = f"https://oauth2:{self.config.token}@{host}\n"
+            
+            # Utiliser le credential store Git
+            # Git cherche ~/.git-credentials par défaut
+            git_credentials = Path.home() / ".git-credentials"
+            git_credentials.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Lire les credentials existants
+            existing = set()
+            if git_credentials.exists():
+                with open(git_credentials) as f:
+                    existing = set(line.strip() for line in f if line.strip())
+            
+            # Ajouter le nouveau credential
+            existing.add(credential_line.strip())
+            
+            # Écrire avec permissions restrictives
+            with open(git_credentials, "w") as f:
+                f.write("\n".join(sorted(existing)) + "\n")
+            
+            # Permissions restrictives (lecture/écriture pour le propriétaire uniquement)
+            os.chmod(git_credentials, stat.S_IRUSR | stat.S_IWUSR)
+            
+        except Exception as e:
+            logger.debug(f"Erreur lors du stockage du credential: {e}")
+
     def _clone_with_retry(
         self, clone_url: str, target_path: Path
     ) -> Tuple[bool, Optional[str]]:
-        """Clone avec retry automatique.
+        """Clone avec retry automatique et gestion sécurisée des credentials.
 
         Args:
-            clone_url: URL de clonage
+            clone_url: URL de clonage (sans token)
             target_path: Chemin de destination
 
         Returns:
             Tuple (succès, message_erreur)
         """
         last_error: Optional[str] = None
+        askpass_script: Optional[Path] = None
 
-        for attempt in range(self.config.max_retries + 1):
-            try:
-                # Options de clonage avec timeout
-                env = {"GIT_HTTP_CONNECT_TIMEOUT": str(self.config.git_timeout)}
-                clone_kwargs: dict[str, Any] = {"progress": None, "env": env}
+        try:
+            # Créer le script askpass si nécessaire (pour HTTP avec token)
+            if self.config.clone_method == "http" and self.config.token:
+                askpass_script = self._create_askpass_script()
+            
+            for attempt in range(self.config.max_retries + 1):
+                try:
+                    # Options de clonage avec timeout
+                    env = os.environ.copy()
+                    env["GIT_HTTP_CONNECT_TIMEOUT"] = str(self.config.git_timeout)
+                    
+                    # Utiliser GIT_ASKPASS pour fournir le token de manière sécurisée
+                    if askpass_script:
+                        env["GIT_ASKPASS"] = str(askpass_script)
+                        env["GIT_TERMINAL_PROMPT"] = "0"  # Désactiver les prompts interactifs
+                    
+                    clone_kwargs: dict[str, Any] = {"progress": None, "env": env}
 
-                # Shallow clone
-                if self.config.clone_depth > 0:
-                    clone_kwargs["depth"] = self.config.clone_depth
+                    # Shallow clone
+                    if self.config.clone_depth > 0:
+                        clone_kwargs["depth"] = self.config.clone_depth
 
-                # Single branch (clone uniquement la branche par défaut)
-                if self.config.single_branch:
-                    clone_kwargs["single_branch"] = True
+                    # Single branch (clone uniquement la branche par défaut)
+                    if self.config.single_branch:
+                        clone_kwargs["single_branch"] = True
 
-                # Partial clone (filter blobs) - pour les très gros repos
-                if self.config.filter_blobs:
-                    clone_kwargs["filter"] = "blob:none"
+                    # Partial clone (filter blobs) - pour les très gros repos
+                    if self.config.filter_blobs:
+                        clone_kwargs["filter"] = "blob:none"
 
-                git.Repo.clone_from(clone_url, target_path, **clone_kwargs)
-                return True, None
+                    git.Repo.clone_from(clone_url, target_path, **clone_kwargs)
+                    
+                    # Après clonage réussi, nettoyer le remote et configurer credential helper
+                    if self.config.clone_method == "http" and self.config.token:
+                        self._setup_credential_helper(target_path)
+                    
+                    return True, None
 
-            except GitCommandError as e:
-                last_error = str(e)
-                # Nettoyer le dossier partiel si créé
-                if target_path.exists():
-                    import shutil
+                except GitCommandError as e:
+                    last_error = str(e)
+                    # Nettoyer le dossier partiel si créé
+                    if target_path.exists():
+                        import shutil
+                        shutil.rmtree(target_path, ignore_errors=True)
 
-                    shutil.rmtree(target_path, ignore_errors=True)
+                    if attempt < self.config.max_retries:
+                        delay = 2 ** attempt  # Backoff exponentiel
+                        logger.debug(f"Clone échoué, retry {attempt + 1} dans {delay}s...")
+                        time.sleep(delay)
 
-                if attempt < self.config.max_retries:
-                    delay = 2 ** attempt  # Backoff exponentiel
-                    logger.debug(f"Clone échoué, retry {attempt + 1} dans {delay}s...")
-                    time.sleep(delay)
-
-        return False, f"Échec après {self.config.max_retries + 1} tentatives: {last_error}"
+            return False, f"Échec après {self.config.max_retries + 1} tentatives: {last_error}"
+        
+        finally:
+            # Nettoyer le script temporaire
+            if askpass_script and askpass_script.exists():
+                try:
+                    askpass_script.unlink()
+                except Exception:
+                    pass
 
     def update_repository(
         self, path: Path, project: GitLabProject
@@ -470,4 +596,43 @@ class GitOperations:
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             logger.error("Git n'est pas installé ou n'est pas dans le PATH")
+            return False
+
+    def clean_remote_url(self, repo_path: Path) -> bool:
+        """Nettoie l'URL du remote pour enlever les credentials.
+        
+        Utile pour migrer les dépôts existants qui ont encore le token dans l'URL.
+        
+        Args:
+            repo_path: Chemin du dépôt
+            
+        Returns:
+            True si le remote a été nettoyé, False sinon
+        """
+        try:
+            repo = git.Repo(repo_path)
+            if "origin" not in repo.remotes:
+                return False
+            
+            remote = repo.remotes.origin
+            remote_url = remote.url
+            
+            # Vérifier si l'URL contient des credentials
+            import re
+            clean_url = re.sub(r"://[^@]+@", "://", remote_url)
+            
+            if clean_url != remote_url:
+                logger.debug(f"Nettoyage du remote pour {repo_path}")
+                remote.set_url(clean_url)
+                
+                # Configurer le credential helper si on a un token
+                if self.config.token and self.config.clone_method == "http":
+                    repo.git.config("credential.helper", "store", local=True)
+                    self._store_credential(repo_path, clean_url)
+                
+                return True
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Erreur lors du nettoyage du remote: {e}")
             return False

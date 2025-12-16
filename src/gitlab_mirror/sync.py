@@ -117,6 +117,13 @@ class ProjectSynchronizer:
 
         # Cas 3: C'est un dépôt Git mais ne correspond pas au projet
         if not self.git_ops.matches_project(local_path, project):
+            # Essayer de nettoyer le remote (peut contenir un token qui empêche la correspondance)
+            self.git_ops.clean_remote_url(local_path)
+            
+            # Réessayer la correspondance après nettoyage
+            if self.git_ops.matches_project(local_path, project):
+                return ProjectStatus.ALREADY_UP_TO_DATE
+            
             remote_url = self.git_ops.get_repository_remote_url(local_path)
             logger.warning(
                 f"{project.path_with_namespace}: "
