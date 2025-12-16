@@ -282,8 +282,8 @@ def print_summary(summary: SyncSummary, config: Config, elapsed: float = 0) -> N
     "--threads",
     "-j",
     type=int,
-    default=4,
-    help="Nombre de threads parallèles (défaut: 4)",
+    default=None,
+    help="Nombre de threads parallèles (défaut: depuis config.toml ou 4)",
 )
 @click.option(
     "--exclude",
@@ -372,7 +372,7 @@ def sync_cmd(
     no_update: bool,
     skip_recent: float,
     no_smart: bool,
-    threads: int,
+    threads: Optional[int],
     excludes: tuple[str, ...],
     includes: tuple[str, ...],
     depth: int,

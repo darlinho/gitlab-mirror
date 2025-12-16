@@ -51,6 +51,7 @@ poetry.lock
 # Configuration
 .env
 config.local.yaml
+.cursorrules
 
 # Synchronized repositories
 repos/

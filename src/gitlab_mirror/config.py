@@ -286,31 +286,131 @@ def load_config(
     gitlab_url: Optional[str] = None,
     token: Optional[str] = None,
     root_dir: Optional[Path] = None,
-    dry_run: bool = False,
-    verbose: bool = False,
-    debug: bool = False,
+    dry_run: Optional[bool] = None,
+    verbose: Optional[bool] = None,
+    debug: Optional[bool] = None,
     clone_method: Optional[str] = None,
-    update_existing: bool = True,
-    smart_update: bool = True,
-    skip_recent_hours: float = 0,
-    max_workers: int = 4,
+    update_existing: Optional[bool] = None,
+    smart_update: Optional[bool] = None,
+    skip_recent_hours: Optional[float] = None,
+    max_workers: Optional[int] = None,
     exclude_patterns: Optional[list[str]] = None,
     include_patterns: Optional[list[str]] = None,
-    clone_depth: int = 0,
-    single_branch: bool = False,
-    filter_blobs: bool = False,
-    json_output: bool = False,
-    prune: bool = False,
-    include_archived: bool = False,
-    since_days: int = 0,
-    log_file: str = "",
-    git_timeout: int = 300,
+    clone_depth: Optional[int] = None,
+    single_branch: Optional[bool] = None,
+    filter_blobs: Optional[bool] = None,
+    json_output: Optional[bool] = None,
+    prune: Optional[bool] = None,
+    include_archived: Optional[bool] = None,
+    since_days: Optional[int] = None,
+    log_file: Optional[str] = None,
+    git_timeout: Optional[int] = None,
 ) -> Config:
-    """Charge la configuration avec priorité aux arguments CLI."""
-    # Charger la config de base depuis les variables d'environnement / fichier
+    """Charge la configuration avec priorité aux arguments CLI.
+    
+    Ordre de priorité (du plus faible au plus fort) :
+    1. Valeurs par défaut de la classe Config
+    2. Variables d'environnement / fichier .env
+    3. Fichier TOML (config.toml, .lgm.toml, etc.)
+    4. Arguments CLI
+    """
+    # Charger la config de base depuis les variables d'environnement / fichier .env
     config = Config()
+    
+    # Charger le fichier TOML et appliquer les valeurs
+    toml_config = load_toml_config()
+    if toml_config:
+        # Support des clés au niveau racine (pour compatibilité)
+        if "gitlab_url" in toml_config:
+            config.url = toml_config["gitlab_url"]
+        if "url" in toml_config:
+            config.url = toml_config["url"]
+        if "token" in toml_config:
+            config.token = toml_config["token"]
+        if "root_dir" in toml_config:
+            config.root_dir = Path(toml_config["root_dir"]).expanduser().resolve()
+        if "clone_method" in toml_config:
+            config.clone_method = toml_config["clone_method"]
+        if "dry_run" in toml_config:
+            config.dry_run = toml_config["dry_run"]
+        if "update_existing" in toml_config:
+            config.update_existing = toml_config["update_existing"]
+        
+        # Section [performance]
+        if "performance" in toml_config:
+            perf = toml_config["performance"]
+            if "max_workers" in perf:
+                config.max_workers = perf["max_workers"]
+            if "git_timeout" in perf:
+                config.git_timeout = perf["git_timeout"]
+        
+        # Section [smart_update]
+        if "smart_update" in toml_config:
+            smart = toml_config["smart_update"]
+            if "enabled" in smart:
+                config.smart_update = smart["enabled"]
+            if "skip_recent_hours" in smart:
+                config.skip_recent_hours = smart["skip_recent_hours"]
+        
+        # Section [clone]
+        if "clone" in toml_config:
+            clone = toml_config["clone"]
+            if "depth" in clone:
+                config.clone_depth = clone["depth"]
+            if "prune" in clone:
+                config.prune = clone["prune"]
+            if "single_branch" in clone:
+                config.single_branch = clone["single_branch"]
+            if "filter_blobs" in clone:
+                config.filter_blobs = clone["filter_blobs"]
+        
+        # Section [filters]
+        if "filters" in toml_config:
+            filters = toml_config["filters"]
+            if "exclude" in filters:
+                patterns = filters["exclude"]
+                config.exclude_patterns = patterns if isinstance(patterns, list) else [patterns]
+            if "include" in filters:
+                patterns = filters["include"]
+                config.include_patterns = patterns if isinstance(patterns, list) else [patterns]
+        
+        # Autres clés au niveau racine (pour compatibilité, seulement si pas dans une section)
+        # Note: Les sections ont la priorité, donc on ne surcharge que si la clé n'est pas une section
+        if "smart_update" in toml_config and not isinstance(toml_config["smart_update"], dict):
+            config.smart_update = toml_config["smart_update"]
+        if "skip_recent_hours" in toml_config and "smart_update" not in toml_config:
+            # Seulement si pas déjà défini dans la section smart_update
+            config.skip_recent_hours = toml_config["skip_recent_hours"]
+        if "max_workers" in toml_config and "performance" not in toml_config:
+            # Seulement si pas déjà défini dans la section performance
+            config.max_workers = toml_config["max_workers"]
+        if "clone_depth" in toml_config and "clone" not in toml_config:
+            # Seulement si pas déjà défini dans la section clone
+            config.clone_depth = toml_config["clone_depth"]
+        if "single_branch" in toml_config and "clone" not in toml_config:
+            config.single_branch = toml_config["single_branch"]
+        if "filter_blobs" in toml_config and "clone" not in toml_config:
+            config.filter_blobs = toml_config["filter_blobs"]
+        if "prune" in toml_config and "clone" not in toml_config:
+            config.prune = toml_config["prune"]
+        if "git_timeout" in toml_config and "performance" not in toml_config:
+            config.git_timeout = toml_config["git_timeout"]
+        if "json_output" in toml_config:
+            config.json_output = toml_config["json_output"]
+        if "include_archived" in toml_config:
+            config.include_archived = toml_config["include_archived"]
+        if "since_days" in toml_config:
+            config.since_days = toml_config["since_days"]
+        if "log_file" in toml_config:
+            config.log_file = toml_config["log_file"]
+        if "exclude_patterns" in toml_config and "filters" not in toml_config:
+            patterns = toml_config["exclude_patterns"]
+            config.exclude_patterns = patterns if isinstance(patterns, list) else [patterns]
+        if "include_patterns" in toml_config and "filters" not in toml_config:
+            patterns = toml_config["include_patterns"]
+            config.include_patterns = patterns if isinstance(patterns, list) else [patterns]
 
-    # Surcharger avec les arguments CLI fournis
+    # Surcharger avec les arguments CLI fournis (priorité la plus haute)
     if gitlab_url is not None:
         config.url = gitlab_url
     if token is not None:
@@ -319,26 +419,43 @@ def load_config(
         config.root_dir = root_dir.expanduser().resolve()
     if clone_method is not None:
         config.clone_method = clone_method
-
-    config.dry_run = dry_run
-    config.verbose = verbose or debug
-    config.debug = debug
-    config.update_existing = update_existing
-    config.smart_update = smart_update
-    config.skip_recent_hours = skip_recent_hours
-    config.max_workers = max_workers
-    config.clone_depth = clone_depth
-    config.single_branch = single_branch
-    config.filter_blobs = filter_blobs
-    config.json_output = json_output
-    config.prune = prune
-    config.include_archived = include_archived
-    config.since_days = since_days
-    config.log_file = log_file
-    config.git_timeout = git_timeout
-    if exclude_patterns:
+    if dry_run is not None:
+        config.dry_run = dry_run
+    if verbose is not None:
+        config.verbose = verbose
+    if debug is not None:
+        config.debug = debug
+        if debug:
+            config.verbose = True  # debug implique verbose
+    if update_existing is not None:
+        config.update_existing = update_existing
+    if smart_update is not None:
+        config.smart_update = smart_update
+    if skip_recent_hours is not None:
+        config.skip_recent_hours = skip_recent_hours
+    if max_workers is not None:
+        config.max_workers = max_workers
+    if clone_depth is not None:
+        config.clone_depth = clone_depth
+    if single_branch is not None:
+        config.single_branch = single_branch
+    if filter_blobs is not None:
+        config.filter_blobs = filter_blobs
+    if json_output is not None:
+        config.json_output = json_output
+    if prune is not None:
+        config.prune = prune
+    if include_archived is not None:
+        config.include_archived = include_archived
+    if since_days is not None:
+        config.since_days = since_days
+    if log_file is not None:
+        config.log_file = log_file
+    if git_timeout is not None:
+        config.git_timeout = git_timeout
+    if exclude_patterns is not None:
         config.exclude_patterns = list(exclude_patterns)
-    if include_patterns:
+    if include_patterns is not None:
         config.include_patterns = list(include_patterns)
 
     return config
